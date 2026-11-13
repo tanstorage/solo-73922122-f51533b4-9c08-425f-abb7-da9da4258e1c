@@ -2,10 +2,13 @@
 
 设计要点
 ========
-1. 单一快照：整个任务在一条连接、一个 REPEATABLE READ READ ONLY 事务中完成。
+1. 单一快照：整个任务在一条连接、一个 REPEATABLE READ 事务中完成。
    PostgreSQL 事务快照在事务首条语句时确定，之后无论源库如何增改删，
    本事务内所有查询（含分批 keyset 读取）看到的都是同一版本的数据，
    不会混用新旧状态，且不阻塞源库写入。
+   事务为读写事务：在同一快照内把逐检测修订依据（xmin/result/measured）
+   写入 extraction_inspection_basis，保证依据与导出的 SQL 来自完全相同的快照，
+   并与任务结果在同一事务提交，失败整体回滚不留残依据。
 2. 复测图递归：retest_of_id 自引用关系按“无向图”遍历——既顺着
    retest_of_id 找父检测，也反向找以当前检测为复测对象的子检测，
    visited 集合保证成环（含自引用）时可终止且完整还原。
@@ -23,6 +26,7 @@ import decimal
 import os
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import psycopg
@@ -41,6 +45,7 @@ class ExtractionStats:
     snapshot_xmin: int | None = None
     inspection_ids: list[int] = field(default_factory=list)
     rows: dict[str, int] = field(default_factory=dict)
+    basis_rows: int = 0
 
 
 # --------------------------------------------------------------------------
@@ -155,11 +160,13 @@ def run_extraction(
     dsn: str,
     inspection_ids: list[int],
     out_path: str,
+    job_id: str,
     delay_seconds: float = 0.0,
 ) -> ExtractionStats:
-    """生成可直接导入空 PostgreSQL 库的 SQL 脚本。
+    """生成可直接导入空 PostgreSQL 库的 SQL 脚本，并在同快照事务内写入修订依据。
 
-    全部成功才落盘到 out_path；任何异常都不会留下残件（由调用方清理临时文件）。
+    全部成功才落盘到 out_path 并提交事务；任何异常都会回滚事务、删除残件
+    （由调用方兜底清理临时文件）。
     delay_seconds 仅用于演示：快照建立后、遍历开始前保持事务打开一段时间，
     期间源库的增改删对本事务不可见，以此直观验证快照一致性。
     """
@@ -169,10 +176,12 @@ def run_extraction(
 
     stats = ExtractionStats()
 
-    # autocommit=True 后手工开启只读快照事务，事务持续到任务结束
+    # autocommit=True 后手工开启快照事务，事务持续到任务结束。
+    # 读写事务：快照读取与“修订依据写入”必须在同一事务内原子提交。
     conn = psycopg.connect(dsn, autocommit=True, connect_timeout=10)
+    committed = False
     try:
-        conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
         snapshot = conn.execute("SELECT pg_current_snapshot()::text").fetchone()[0]
         stats.snapshot_xmin = int(str(snapshot).split(":")[0])
 
@@ -208,14 +217,29 @@ def run_extraction(
             )
             _write_constraints_and_indexes(f, metas)
             f.write("\n-- 提取结束\n")
+
+        # 修订依据：与上面的全部读取处于同一快照事务，逐检测记录版本号与原值。
+        # 之后任何对 inspection 的 UPDATE（含改回原值）/DELETE/同 ID 重建都会使
+        # xmin 变化或行消失，回写时据此判定过期。
+        stats.basis_rows = _persist_basis(conn, job_id, wanted)
+
         # 整份文件写完后原子替换，外部只可能看到“完整文件”或“没有文件”
         os.replace(tmp_path, out_path)
+        # SQL 产物与修订依据同一事务提交；提交失败则依据回滚、产物删除
+        conn.execute("COMMIT")
+        committed = True
         return stats
     finally:
-        try:
-            conn.execute("ROLLBACK")
-        except Exception:
-            pass
+        if not committed:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            for p in (out_path, Path(str(out_path) + ".part")):
+                try:
+                    p.unlink()
+                except FileNotFoundError:
+                    pass
         conn.close()
 
 
@@ -286,6 +310,42 @@ def _fk_closure(
         batches.update(r[0] for r in rows)
 
     return workpieces, batches
+
+
+def _persist_basis(
+    conn: psycopg.Connection, job_id: str, inspection_ids: set[int]
+) -> int:
+    """在当前快照事务内逐检测写入回写修订依据，返回写入条数。
+
+    依据包含快照版本号 xmin 与当时的 result/measured。同一 job 重跑时先清理
+    旧依据（实践中任务只执行一次，这里做幂等兜底）。
+    """
+    conn.execute(
+        "DELETE FROM extraction_inspection_basis WHERE job_id = %s", (job_id,)
+    )
+    ids = sorted(inspection_ids)
+    total = 0
+    for i in range(0, len(ids), PAGE_SIZE):
+        chunk = ids[i : i + PAGE_SIZE]
+        # xmin::text::bigint：xmin 为 xid 类型，参数化后转 BIGINT 存储
+        rows = conn.execute(
+            "SELECT inspection_id, xmin::text::bigint, result, measured "
+            "FROM inspection WHERE inspection_id = ANY(%s) ORDER BY inspection_id",
+            (chunk,),
+        ).fetchall()
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO extraction_inspection_basis "
+                "(job_id, inspection_id, base_xmin, base_result, base_measured) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                [(job_id, r[0], r[1], r[2], r[3]) for r in rows],
+            )
+        total += len(rows)
+    if total != len(inspection_ids):
+        raise ExtractionError(
+            f"修订依据写入不完整: 期望 {len(inspection_ids)} 条，实际 {total} 条"
+        )
+    return total
 
 
 # --------------------------------------------------------------------------

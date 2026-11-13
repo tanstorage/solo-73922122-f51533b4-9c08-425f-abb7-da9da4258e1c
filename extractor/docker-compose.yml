@@ -19,6 +19,7 @@ services:
     volumes:
       - ./sql/01_schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
       - ./sql/02_seed.sql:/docker-entrypoint-initdb.d/02_seed.sql:ro
+      - ./sql/03_corrections.sql:/docker-entrypoint-initdb.d/03_corrections.sql:ro
       - source_pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U qc -d qcwarehouse"]
